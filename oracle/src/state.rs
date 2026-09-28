@@ -36,6 +36,10 @@ pub struct PriceCache {
     pub prices: BTreeMap<String, CachedPrice>,
     #[serde(skip_serializing_if = "Option::is_none")]
     pub last_updated: Option<SystemTime>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_submitted_medians: Option<BTreeMap<String, i128>>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub last_full_submission: Option<SystemTime>,
 }
 
 #[derive(Debug, Default, Clone, Serialize)]

@@ -192,13 +192,56 @@ pub fn parse_account_balance_response(body: &str) -> Result<i64, RpcError> {
         .find(|b| b.asset_type == "native")
         .ok_or_else(|| RpcError::JsonError("no native balance entry".to_string()))?;
 
-    // Horizon returns XLM as a decimal string "100.0000000" (7 decimal places).
-    let xlm: f64 = native
-        .balance
-        .parse()
-        .map_err(|_| RpcError::JsonError(format!("unparseable balance: {}", native.balance)))?;
+    parse_xlm_balance_to_stroops(&native.balance)
+}
 
-    Ok((xlm * 10_000_000.0) as i64)
+/// Stroops in one XLM: 1 XLM = 10^7 stroops.
+const STROOPS_PER_XLM: i64 = 10_000_000;
+/// Fractional digits Horizon emits for XLM balances ("100.0000000"), which is
+/// exactly stroop precision.
+const HORIZON_XLM_DECIMALS: usize = 7;
+
+/// Convert a Horizon XLM balance string into an exact stroop count.
+///
+/// Horizon renders XLM with exactly [`HORIZON_XLM_DECIMALS`] fractional digits,
+/// which is precisely stroop precision, so the decimal string can be converted
+/// with pure integer arithmetic and no rounding. The previous `f64` round-trip
+/// introduced IEEE-754 error for balances that are not exactly representable in
+/// binary floating point, yielding a stroop value off by one or more from the
+/// true on-chain balance (#736, #899).
+fn parse_xlm_balance_to_stroops(balance: &str) -> Result<i64, RpcError> {
+    let raw = balance;
+    let unparseable = || RpcError::JsonError(format!("unparseable balance: {raw}"));
+
+    let balance = balance.trim();
+    let (whole, fraction) = match balance.split_once('.') {
+        Some((whole, fraction)) => (whole, fraction),
+        None => (balance, ""),
+    };
+
+    if whole.is_empty()
+        || !whole.bytes().all(|b| b.is_ascii_digit())
+        || !fraction.bytes().all(|b| b.is_ascii_digit())
+    {
+        return Err(unparseable());
+    }
+
+    let whole: i64 = whole.parse().map_err(|_| unparseable())?;
+
+    // Horizon emits exactly 7 fractional digits, but pad anything shorter with
+    // zeros and drop anything longer (sub-stroop precision) so the value stays
+    // exact for well-formed input.
+    let fraction = fraction.as_bytes();
+    let mut fraction_stroops = 0i64;
+    for position in 0..HORIZON_XLM_DECIMALS {
+        let digit = fraction.get(position).copied().unwrap_or(b'0');
+        fraction_stroops = fraction_stroops * 10 + i64::from(digit - b'0');
+    }
+
+    whole
+        .checked_mul(STROOPS_PER_XLM)
+        .and_then(|stroops| stroops.checked_add(fraction_stroops))
+        .ok_or_else(unparseable)
 }
 
 /// Fetch the XLM balance for `account_id` from the Horizon server at
@@ -316,6 +359,88 @@ mod tests {
     #[test]
     fn parse_account_balance_malformed_json() {
         let err = parse_account_balance_response("not json").unwrap_err();
+        assert!(matches!(err, RpcError::JsonError(_)));
+    }
+
+    /// #736/#899 - Horizon's balance string has exactly stroop precision, so it
+    /// must not be round-tripped through `f64`. `319202939.9467375` is not
+    /// representable in binary64; the old implementation returned
+    /// `3192029399467376`, one stroop more than the true balance.
+    #[test]
+    fn parse_account_balance_is_exact_for_binary64_unrepresentable_value() {
+        let body = r#"{
+            "id": "GABC",
+            "balances": [{"asset_type":"native","balance":"319202939.9467375"}]
+        }"#;
+        assert_eq!(
+            parse_account_balance_response(body).unwrap(),
+            3_192_029_399_467_375
+        );
+    }
+
+    /// The same defect in the other rounding direction: this balance has no
+    /// exact binary64 representation and previously parsed one stroop low.
+    #[test]
+    fn parse_account_balance_is_exact_when_f64_rounds_down() {
+        let body = r#"{
+            "id": "GABC",
+            "balances": [{"asset_type":"native","balance":"883983974.2838425"}]
+        }"#;
+        assert_eq!(
+            parse_account_balance_response(body).unwrap(),
+            8_839_839_742_838_425
+        );
+    }
+
+    #[test]
+    fn parse_account_balance_pads_short_fraction_to_stroops() {
+        let body = r#"{"id":"GABC","balances":[{"asset_type":"native","balance":"0.5"}]}"#;
+        assert_eq!(parse_account_balance_response(body).unwrap(), 5_000_000);
+    }
+
+    #[test]
+    fn parse_account_balance_accepts_whole_xlm() {
+        let body = r#"{"id":"GABC","balances":[{"asset_type":"native","balance":"100"}]}"#;
+        assert_eq!(parse_account_balance_response(body).unwrap(), 1_000_000_000);
+    }
+
+    #[test]
+    fn parse_account_balance_truncates_sub_stroop_precision() {
+        let body = r#"{"id":"GABC","balances":[{"asset_type":"native","balance":"1.00000009"}]}"#;
+        assert_eq!(parse_account_balance_response(body).unwrap(), 10_000_000);
+    }
+
+    #[test]
+    fn parse_account_balance_accepts_i64_max_stroops() {
+        // i64::MAX = 9223372036854775807 stroops = 922337203685.4775807 XLM.
+        let body = r#"{
+            "id": "GABC",
+            "balances": [{"asset_type":"native","balance":"922337203685.4775807"}]
+        }"#;
+        assert_eq!(parse_account_balance_response(body).unwrap(), i64::MAX);
+    }
+
+    #[test]
+    fn parse_account_balance_rejects_malformed_values() {
+        for balance in ["", "abc", "1.2.3", "-1.0000000", "1,5", "1e7", ".5"] {
+            let body = format!(
+                r#"{{"id":"GABC","balances":[{{"asset_type":"native","balance":"{balance}"}}]}}"#
+            );
+            let err = parse_account_balance_response(&body).unwrap_err();
+            assert!(
+                matches!(err, RpcError::JsonError(_)),
+                "expected JsonError for balance {balance:?}, got {err:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn parse_account_balance_rejects_stroop_overflow() {
+        let body = r#"{
+            "id": "GABC",
+            "balances": [{"asset_type":"native","balance":"922337203686.0000000"}]
+        }"#;
+        let err = parse_account_balance_response(body).unwrap_err();
         assert!(matches!(err, RpcError::JsonError(_)));
     }
 

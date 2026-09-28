@@ -76,19 +76,10 @@ pub fn aggregate_prices(
         }
     }
 
-    let props = compute_confidence_interval_with_spread(&cluster.filtered_prices, max_deviation_bps)
-        .ok_or_else(|| "cannot compute confidence interval".to_string())?;
+    let props =
+        compute_confidence_interval_with_spread(&cluster.filtered_prices, max_deviation_bps)
+            .ok_or_else(|| "cannot compute confidence interval".to_string())?;
     let median = compute_median_allow_single(&cluster.filtered_prices).unwrap_or(props.min);
-
-    let rejected_sources = filter_result
-        .rejected
-        .into_iter()
-        .map(|(source, price, deviation)| RejectedSource {
-            source,
-            price,
-            deviation_bps: deviation,
-        })
-        .collect();
 
     Ok(AggregatedPrice {
         min: props.min,
@@ -653,25 +644,22 @@ mod tests {
         ];
         let result = aggregate_prices(&[100, 101, 1000], &sources, 3, 200);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("insufficient sources in consistent cluster"));
+        assert!(result
+            .unwrap_err()
+            .contains("insufficient sources in consistent cluster"));
     }
 
     #[test]
     fn aggregate_prices_empty_input_with_zero_min_sources_returns_error() {
         // min_sources = 0 bypasses the earlier `prices.len() < min_sources`
-        // guard. #510 named the expected error as "cannot aggregate empty
-        // price list", but no such string exists anywhere in aggregate_prices
-        // or its helpers as currently implemented (confirmed via grep) — the
-        // empty case instead falls through filter_outliers (which returns an
-        // empty result for empty input, not an error) into
-        // compute_confidence_interval_with_spread, which is what actually
-        // rejects it. #510's premise was stale by the time this was worked;
-        // asserting the real error here rather than one that was never
-        // producible.
+        // guard, so the empty case reaches the cluster search. With no prices
+        // there is no cluster to find, so `find_largest_consistent_cluster`
+        // returns `None` and the cycle is rejected there — before any median,
+        // outlier filter, or confidence interval is computed.
         let prices: Vec<i128> = vec![];
         let sources: Vec<String> = vec![];
         let err = aggregate_prices(&prices, &sources, 0, 100).unwrap_err();
-        assert_eq!(err, "cannot compute confidence interval");
+        assert_eq!(err, "no consistent price cluster found");
     }
 
     // #510's third scenario ("construct two sources both outside
@@ -758,7 +746,9 @@ mod tests {
         let sources = vec!["src1".to_string(), "src2".to_string(), "src3".to_string()];
         let result = aggregate_prices(&prices, &sources, 3, 500);
         assert!(result.is_err());
-        assert!(result.unwrap_err().contains("insufficient sources in consistent cluster"));
+        assert!(result
+            .unwrap_err()
+            .contains("insufficient sources in consistent cluster"));
     }
 
     #[test]
@@ -766,7 +756,12 @@ mod tests {
         // 4 sources, min_sources=2. Three honest at [100, 101, 99], one bad at 1000
         // Honest cluster size 3 > min_sources, should succeed with honest median
         let prices = vec![100, 101, 99, 1000];
-        let sources = vec!["src1".to_string(), "src2".to_string(), "src3".to_string(), "bad".to_string()];
+        let sources = vec![
+            "src1".to_string(),
+            "src2".to_string(),
+            "src3".to_string(),
+            "bad".to_string(),
+        ];
         let result = aggregate_prices(&prices, &sources, 2, 500).unwrap();
         assert_eq!(result.sources_used.len(), 3);
         assert_eq!(result.median, 100); // median of [99, 100, 101]

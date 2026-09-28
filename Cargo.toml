@@ -31,10 +31,12 @@ mismatched_lifetime_syntaxes = "allow"
 overflow-checks = true
 panic = "abort"
 
-# Force all transitive stellar-strkey versions to converge on 0.0.18 (#1007).
-# stellar-xdr v27 pins stellar-strkey 0.0.13 transitively; the direct
-# dependency in oracle/Cargo.toml is 0.0.18. Pre-1.0 semver cannot unify
-# these, so three copies were being compiled. This patch collapses them.
-[patch.crates-io]
-stellar-strkey = { version = "0.0.18" }
-
+# NOTE: there is intentionally no [patch.crates-io] for stellar-strkey here.
+# A version-only patch (`stellar-strkey = { version = "0.0.18" }`, added for
+# #1007 to collapse the three copies stellar-xdr v27 pulls in) is rejected by
+# cargo >= 1.95 with "patch for `stellar-strkey` points to the same source,
+# but patches must point to different sources" — a manifest-level error that
+# made every cargo invocation in this workspace fail before compiling a single
+# line. The section was therefore inert, not load-bearing, and has been
+# removed. Collapsing the copies for real requires a patch entry with a real
+# `path` or `git` source, which is a separate change.

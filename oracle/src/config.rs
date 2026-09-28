@@ -379,6 +379,49 @@ impl Config {
             Duration::from_millis(DEFAULT_KEEPER_LOOP_MS)
         );
 
+        // Every contract role must point at a different contract. `required`
+        // only proves each var is present and non-empty, so pasting one
+        // address into two slots (an easy copy/paste slip from a deployment
+        // manifest) used to boot cleanly and then fail much later, at RPC
+        // simulation time, with a generic contract-level error naming neither
+        // variable. Catch it here and name both sides.
+        //
+        // Values are compared trimmed, so a stray trailing space cannot hide a
+        // collision. They are not case-folded: Soroban strkeys are
+        // case-sensitive, and a mixed-case value is invalid input that
+        // simulation will reject anyway.
+        let contract_roles: [(&'static str, &str); 7] = [
+            ("ORACLE_CONTRACT_ID", &oracle_contract_id),
+            ("ROLE_STORE", &role_store_contract_id),
+            ("DATA_STORE", &data_store_contract_id),
+            ("ORDER_HANDLER", &order_handler_contract_id),
+            ("DEPOSIT_HANDLER", &deposit_handler_contract_id),
+            ("WITHDRAWAL_HANDLER", &withdrawal_handler_contract_id),
+            ("READER", &reader_contract_id),
+        ];
+        let mut seen: std::collections::HashMap<&str, &'static str> =
+            std::collections::HashMap::new();
+        for (var, value) in contract_roles {
+            let value = value.trim();
+            // A missing/empty value is already reported by `required`; don't
+            // pile a duplicate-value error on top of it.
+            if value.is_empty() {
+                continue;
+            }
+            match seen.get(value) {
+                Some(previous) => errors.push(EnvError::InvalidVar {
+                    var,
+                    reason: format!(
+                        "is set to the same contract ID as {previous} ({value}); each contract \
+                         role must point at a distinct contract"
+                    ),
+                }),
+                None => {
+                    seen.insert(value, var);
+                }
+            }
+        }
+
         if !errors.is_empty() {
             return Err(EnvErrors(errors));
         }
@@ -478,7 +521,7 @@ fn validate_hex_key(
 /// Validate a Stellar strkey (account `G…` / secret seed `S…`) for shape only:
 /// 56-char base32 with the expected version prefix. This catches typos and
 /// swapped vars at boot; it does not verify the CRC16 or that a secret derives
-/// the configured account (those are wired with the keeper in #3).
+/// the configured account (those are tracked in the keeper module).
 fn validate_strkey(var: &'static str, value: String, prefix: char) -> Result<String, EnvError> {
     let invalid = |reason: String| EnvError::InvalidVar { var, reason };
     if value.len() != 56 {
@@ -507,7 +550,7 @@ fn load_price_feed_config(raw: Option<&str>) -> Result<PriceFeedConfig, ConfigEr
 ///
 /// Expected format:
 /// ```json
-/// [{"symbol":"BTC","stellar_address":"C...","sources":["binance","coinbase"]}]
+/// [{"symbol":"BTC","stellar_address":"C...","sources":["binance","coinbase"],"binance_symbol":"BTCUSDT","coinbase_symbol":"BTC"}]
 /// ```
 pub fn parse_price_feed_config(raw: &str) -> Result<PriceFeedConfig, ConfigError> {
     let tokens = shared_config::parse_token_configs(raw)?;
@@ -976,6 +1019,122 @@ mod tests {
         ])
     }
 
+    // ── distinct contract roles ───────────────────────────────────────────────
+
+    /// Flattens `EnvErrors` into one string per entry so a test can assert on
+    /// which variables were reported.
+    fn error_messages(err: &EnvErrors) -> Vec<String> {
+        match err {
+            EnvErrors(list) => list.iter().map(|e| e.to_string()).collect(),
+        }
+    }
+
+    #[test]
+    fn distinct_contract_ids_boot_cleanly() {
+        let env = valid_env();
+        assert!(
+            Config::from_lookup(|key| env.get(key).cloned()).is_ok(),
+            "seven distinct contract IDs must not trip the duplicate check"
+        );
+    }
+
+    #[test]
+    fn duplicate_contract_ids_are_rejected_at_boot_naming_both_vars() {
+        let mut env = valid_env();
+        // The realistic operator slip: ORDER_HANDLER copy-pasted over
+        // DEPOSIT_HANDLER.
+        let shared = env.get("ORDER_HANDLER").unwrap().clone();
+        env.insert("DEPOSIT_HANDLER", shared.clone());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("duplicate contract IDs must fail at boot");
+
+        let messages = error_messages(&err);
+        assert_eq!(messages.len(), 1, "expected one error, got {messages:?}");
+        let message = &messages[0];
+        assert!(
+            message.contains("DEPOSIT_HANDLER"),
+            "error must name the offending var: {message}"
+        );
+        assert!(
+            message.contains("ORDER_HANDLER"),
+            "error must name the var it collides with: {message}"
+        );
+        assert!(
+            message.contains(&shared),
+            "error must quote the duplicated ID: {message}"
+        );
+    }
+
+    #[test]
+    fn every_contract_role_pair_is_checked() {
+        // Whichever var is overwritten with another var's value, the boot must
+        // fail — the check is not limited to one hand-picked pair.
+        let vars = [
+            "ORACLE_CONTRACT_ID",
+            "ROLE_STORE",
+            "DATA_STORE",
+            "ORDER_HANDLER",
+            "DEPOSIT_HANDLER",
+            "WITHDRAWAL_HANDLER",
+            "READER",
+        ];
+        for (i, target) in vars.iter().enumerate() {
+            let source = vars[(i + 1) % vars.len()];
+            let mut env = valid_env();
+            let value = env.get(source).unwrap().clone();
+            env.insert(*target, value);
+
+            let err = Config::from_lookup(|key| env.get(key).cloned())
+                .expect_err(&format!("{target} == {source} must fail at boot"));
+            let messages = error_messages(&err);
+            assert_eq!(
+                messages.len(),
+                1,
+                "{target} == {source}: expected one error, got {messages:?}"
+            );
+            assert!(
+                messages[0].contains(target) && messages[0].contains(source),
+                "{target} == {source}: error must name both vars, got {}",
+                messages[0]
+            );
+        }
+    }
+
+    #[test]
+    fn duplicate_detection_ignores_surrounding_whitespace() {
+        let mut env = valid_env();
+        let order_handler = env.get("ORDER_HANDLER").unwrap().clone();
+        env.insert("READER", format!("  {order_handler}  "));
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("trailing whitespace must not hide a collision");
+        let messages = error_messages(&err);
+        assert!(
+            messages[0].contains("READER"),
+            "error must name the offending var: {messages:?}"
+        );
+    }
+
+    #[test]
+    fn missing_contract_id_is_reported_once_not_as_a_duplicate() {
+        let mut env = valid_env();
+        env.remove("READER");
+
+        let err = Config::from_lookup(|key| env.get(key).cloned())
+            .expect_err("a missing var must still fail");
+        let messages = error_messages(&err);
+        assert_eq!(
+            messages.len(),
+            1,
+            "an absent var should not also be reported as a duplicate: {messages:?}"
+        );
+        assert!(
+            messages[0].contains("READER"),
+            "error must name the missing var: {messages:?}"
+        );
+    }
+
     #[test]
     fn config_from_lookup_uses_testnet_defaults_and_token_file_fallback() {
         let env = valid_env();
@@ -1264,5 +1423,37 @@ mod tests {
             "expected at least 2 errors, got {}",
             err.0.len()
         );
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_zero_set_prices_tx_fee() {
+        let mut env = valid_env();
+        env.insert("SET_PRICES_TX_FEE", "0".to_string());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+
+        assert!(matches!(
+            &err.0[0],
+            EnvError::InvalidVar {
+                var: "SET_PRICES_TX_FEE",
+                ..
+            }
+        ));
+    }
+
+    #[test]
+    fn config_from_lookup_rejects_zero_keeper_tx_fee() {
+        let mut env = valid_env();
+        env.insert("KEEPER_TX_FEE", "0".to_string());
+
+        let err = Config::from_lookup(|key| env.get(key).cloned()).unwrap_err();
+
+        assert!(matches!(
+            &err.0[0],
+            EnvError::InvalidVar {
+                var: "KEEPER_TX_FEE",
+                ..
+            }
+        ));
     }
 }

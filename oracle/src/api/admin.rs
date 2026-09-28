@@ -76,9 +76,26 @@ pub async fn oracle_status(
         .cloned()
         .collect();
 
+    // Check keeper balance using the same pattern as keeper_balance handler (#871).
+    let keeper_cfg = crate::keeper::KeeperBalanceConfig {
+        horizon_url: state.config.horizon_url.clone(),
+        account_id: state.config.keeper_account_id.clone(),
+        min_balance_xlm: state.config.min_keeper_balance_xlm,
+    };
+
+    let keeper_balance = crate::retry::retry_with_backoff(
+        || crate::keeper::check_keeper_balance(&keeper_cfg, &state.keeper_balance_below_min),
+        KEEPER_BALANCE_RETRY_ATTEMPTS,
+        KEEPER_BALANCE_RETRY_BASE_DELAY_MS,
+        30_000,
+    )
+    .await
+    .ok()
+    .map(|stroops| stroops as f64 / crate::keeper::XLM_IN_STROOPS as f64);
+
     Json(OracleStatusResponse {
         last_cycle_time,
-        keeper_balance: None,
+        keeper_balance,
         prices,
         recent_errors,
     })

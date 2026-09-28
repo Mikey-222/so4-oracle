@@ -151,8 +151,10 @@ mod tests {
         let sc_addr = strkey_to_sc_address(addr).unwrap();
         match sc_addr {
             stellar_xdr::ScAddress::Contract(contract_id) => {
-                // Round-trip: convert the Hash bytes back to a contract strkey
-                let roundtrip = stellar_strkey::contract::ContractId(contract_id.0).to_string();
+                // Round-trip: wrap the Hash bytes back into a contract strkey.
+                let roundtrip =
+                    stellar_strkey::Strkey::Contract(stellar_strkey::Contract(contract_id.0 .0))
+                        .to_string();
                 assert_eq!(roundtrip, addr);
             }
             other => panic!("expected ScAddress::Contract, got {other:?}"),
@@ -183,8 +185,12 @@ mod tests {
         // S... secret seed is unsupported
         let err = strkey_to_sc_address("SCZANGBA5YHTNYVVV2M3SFZJ5B5Z2B6XR57DGZNH5QTW3JJDEYTHKQZV")
             .unwrap_err();
+        // stellar-strkey 0.0.18 rejects the payload during decode with a
+        // dedicated S-prefix diagnostic before `Strkey` is ever constructed, so
+        // the failure surfaces as an "invalid strkey" decode error rather than
+        // the "unsupported strkey type" arm.
         assert!(
-            err.contains("unsupported strkey type"),
+            err.starts_with("invalid strkey") && err.contains("S`-prefixed"),
             "unexpected error: {err}"
         );
     }

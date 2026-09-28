@@ -180,7 +180,7 @@ pub fn validate_pyth_price(
     // the future (malformed Hermes response, misbehaving publisher, or clock
     // skew) must not silently pass the staleness check via saturating_sub's
     // clamping to 0, which would treat it as maximally fresh.
-    let MAX_FUTURE_SKEW_SECONDS: u64 = 30;
+    const MAX_FUTURE_SKEW_SECONDS: u64 = 30;
     if publish_time > now_seconds {
         let skew = publish_time - now_seconds;
         if skew > MAX_FUTURE_SKEW_SECONDS {

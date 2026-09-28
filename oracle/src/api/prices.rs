@@ -1,4 +1,3 @@
-use std::sync::atomic::AtomicBool;
 use std::sync::Arc;
 use std::time::Duration;
 
@@ -11,8 +10,17 @@ use serde::{Deserialize, Serialize};
 use super::{AdminAuth, ApiError};
 use crate::state::{AppState, CachedPrice, FailedSubmission};
 
+/// Attempts for each `/ready` external probe. The keeper-balance check has
+/// retried since #590; the RPC-reachability check uses the same policy (#894).
 const READY_BALANCE_RETRY_ATTEMPTS: u32 = 3;
+/// Base delay for the exponential backoff between `/ready` probe attempts.
 const READY_BALANCE_RETRY_BASE_DELAY_MS: u64 = 100;
+/// Per-attempt timeout for the RPC-reachability probe. The shared HTTP client
+/// defaults to 15s, but `perform_external_ready_checks` runs under
+/// `READY_CHECK_TIMEOUT_SECS`; a shorter per-attempt timeout lets all
+/// `READY_BALANCE_RETRY_ATTEMPTS` attempts (plus backoff) complete instead of
+/// the first attempt consuming the whole readiness budget (#894).
+const READY_RPC_PROBE_TIMEOUT_SECS: u64 = 4;
 /// Hard cap on the entire `/ready` external-check path (RPC reachability +
 /// keeper balance with retries). Must stay below both Fly's and Railway's
 /// health-check timeouts so the service returns 503 promptly instead of
@@ -217,12 +225,57 @@ pub async fn ready(State(state): State<Arc<AppState>>) -> Result<Json<HealthResp
     }))
 }
 
-async fn perform_external_ready_checks(state: &AppState) -> Result<(), ApiError> {
-    // Check RPC reachability
-    let rpc_url = &state.config.stellar_rpc_url;
+/// Run a single `/ready` external probe with the shared retry policy (#590,
+/// #894): up to `READY_BALANCE_RETRY_ATTEMPTS` attempts with an exponential
+/// backoff between them. An error for which `is_terminal` returns `true` (for
+/// example `RpcError::BalanceBelowMinimum`) is returned immediately instead of
+/// being retried, preserving the keeper-balance check's fail-fast behaviour.
+async fn retry_ready_probe<T, E, F, Fut>(
+    mut probe: F,
+    is_terminal: impl Fn(&E) -> bool,
+    probe_name: &str,
+) -> Result<T, E>
+where
+    F: FnMut() -> Fut,
+    Fut: std::future::Future<Output = Result<T, E>>,
+    E: std::fmt::Debug,
+{
+    let mut last_error = None;
+
+    for attempt in 1..=READY_BALANCE_RETRY_ATTEMPTS {
+        match probe().await {
+            Ok(value) => return Ok(value),
+            Err(error) => {
+                if is_terminal(&error) {
+                    return Err(error);
+                }
+                tracing::warn!(
+                    attempt,
+                    max_attempts = READY_BALANCE_RETRY_ATTEMPTS,
+                    probe = probe_name,
+                    error = ?error,
+                    "ready probe attempt failed"
+                );
+                last_error = Some(error);
+                if attempt < READY_BALANCE_RETRY_ATTEMPTS {
+                    tokio::time::sleep(Duration::from_millis(
+                        READY_BALANCE_RETRY_BASE_DELAY_MS * 2_u64.pow(attempt - 1),
+                    ))
+                    .await;
+                }
+            }
+        }
+    }
+
+    Err(last_error.expect("READY_BALANCE_RETRY_ATTEMPTS is greater than zero"))
+}
+
+/// A single RPC-reachability probe against the configured Stellar RPC URL.
+async fn probe_rpc_reachability(state: &AppState) -> Result<(), ApiError> {
     let response = state
         .http
-        .get(rpc_url)
+        .get(&state.config.stellar_rpc_url)
+        .timeout(Duration::from_secs(READY_RPC_PROBE_TIMEOUT_SECS))
         .send()
         .await
         .map_err(|_| ApiError::new(StatusCode::SERVICE_UNAVAILABLE, "rpc_unreachable"))?;
@@ -234,6 +287,21 @@ async fn perform_external_ready_checks(state: &AppState) -> Result<(), ApiError>
         ));
     }
 
+    Ok(())
+}
+
+async fn perform_external_ready_checks(state: &AppState) -> Result<(), ApiError> {
+    // Check RPC reachability. This runs before the keeper-balance check, so a
+    // single dropped connection or timeout used to short-circuit the whole
+    // readiness probe; retry it with the same policy as the balance check
+    // (#590, #894).
+    retry_ready_probe(
+        || probe_rpc_reachability(state),
+        |_| false,
+        "rpc reachability",
+    )
+    .await?;
+
     // Check keeper balance
     let keeper_cfg = crate::keeper::KeeperBalanceConfig {
         horizon_url: state.config.horizon_url.clone(),
@@ -241,7 +309,18 @@ async fn perform_external_ready_checks(state: &AppState) -> Result<(), ApiError>
         min_balance_xlm: state.config.min_keeper_balance_xlm,
     };
 
-    match check_keeper_balance_for_ready(&keeper_cfg, &state.keeper_balance_below_min).await {
+    match retry_ready_probe(
+        || crate::keeper::check_keeper_balance(&keeper_cfg, &state.keeper_balance_below_min),
+        |error: &crate::stellar_rpc::RpcError| {
+            matches!(
+                error,
+                crate::stellar_rpc::RpcError::BalanceBelowMinimum { .. }
+            )
+        },
+        "keeper balance",
+    )
+    .await
+    {
         Ok(_) => {}
         Err(crate::stellar_rpc::RpcError::BalanceBelowMinimum { .. }) => {
             return Err(ApiError::new(
@@ -258,39 +337,6 @@ async fn perform_external_ready_checks(state: &AppState) -> Result<(), ApiError>
         }
     }
     Ok(())
-}
-
-async fn check_keeper_balance_for_ready(
-    keeper_cfg: &crate::keeper::KeeperBalanceConfig,
-    below_min: &Arc<AtomicBool>,
-) -> Result<i64, crate::stellar_rpc::RpcError> {
-    let mut last_error = None;
-
-    for attempt in 1..=READY_BALANCE_RETRY_ATTEMPTS {
-        match crate::keeper::check_keeper_balance(keeper_cfg, below_min).await {
-            Ok(stroops) => return Ok(stroops),
-            Err(error @ crate::stellar_rpc::RpcError::BalanceBelowMinimum { .. }) => {
-                return Err(error);
-            }
-            Err(error) => {
-                tracing::warn!(
-                    attempt,
-                    max_attempts = READY_BALANCE_RETRY_ATTEMPTS,
-                    error = %error,
-                    "ready keeper balance attempt failed"
-                );
-                last_error = Some(error);
-                if attempt < READY_BALANCE_RETRY_ATTEMPTS {
-                    tokio::time::sleep(Duration::from_millis(
-                        READY_BALANCE_RETRY_BASE_DELAY_MS * 2_u64.pow(attempt - 1),
-                    ))
-                    .await;
-                }
-            }
-        }
-    }
-
-    Err(last_error.expect("READY_BALANCE_RETRY_ATTEMPTS is greater than zero"))
 }
 
 pub async fn prices(
@@ -331,6 +377,9 @@ pub async fn failed_submissions(
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+    use std::rc::Rc;
+
     use super::*;
     use crate::{AppState, Config};
 
@@ -351,5 +400,79 @@ mod tests {
         assert_eq!(body.keeper_cycle_count, 0);
         assert!(body.last_price_cycle_secs_ago.is_none());
         assert!(body.last_keeper_cycle_secs_ago.is_none());
+    }
+
+    /// #894 - the shared readiness retry helper recovers from a transient error.
+    #[tokio::test(start_paused = true)]
+    async fn retry_ready_probe_recovers_from_transient_failure() {
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = Rc::clone(&calls);
+
+        let result: Result<(), &'static str> = retry_ready_probe(
+            || {
+                let counter = Rc::clone(&counter);
+                async move {
+                    let call = counter.get() + 1;
+                    counter.set(call);
+                    if call < READY_BALANCE_RETRY_ATTEMPTS {
+                        Err("transient")
+                    } else {
+                        Ok(())
+                    }
+                }
+            },
+            |_| false,
+            "test",
+        )
+        .await;
+
+        assert_eq!(result, Ok(()));
+        assert_eq!(calls.get(), READY_BALANCE_RETRY_ATTEMPTS);
+    }
+
+    /// #894 - terminal errors are returned without consuming retries.
+    #[tokio::test(start_paused = true)]
+    async fn retry_ready_probe_returns_terminal_error_immediately() {
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = Rc::clone(&calls);
+
+        let result: Result<(), &'static str> = retry_ready_probe(
+            || {
+                let counter = Rc::clone(&counter);
+                async move {
+                    counter.set(counter.get() + 1);
+                    Err("terminal")
+                }
+            },
+            |_| true,
+            "test",
+        )
+        .await;
+
+        assert_eq!(result, Err("terminal"));
+        assert_eq!(calls.get(), 1);
+    }
+
+    /// #894 - a probe that keeps failing is retried a bounded number of times.
+    #[tokio::test(start_paused = true)]
+    async fn retry_ready_probe_exhausts_attempts() {
+        let calls = Rc::new(Cell::new(0u32));
+        let counter = Rc::clone(&calls);
+
+        let result: Result<(), &'static str> = retry_ready_probe(
+            || {
+                let counter = Rc::clone(&counter);
+                async move {
+                    counter.set(counter.get() + 1);
+                    Err("always fails")
+                }
+            },
+            |_| false,
+            "test",
+        )
+        .await;
+
+        assert_eq!(result, Err("always fails"));
+        assert_eq!(calls.get(), READY_BALANCE_RETRY_ATTEMPTS);
     }
 }

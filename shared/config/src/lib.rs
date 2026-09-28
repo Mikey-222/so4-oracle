@@ -8,12 +8,21 @@ use serde::Deserialize;
 // ── Unified token config ─────────────────────────────────────────────────────
 
 /// A single token entry used by both the oracle cron pipeline and the API
-/// server.  Fields cover both use-cases:
-///   - `symbol`, `stellar_address`, `sources` — oracle feed config
-///   - `min`, `max`, `sources_used` — API price-lookup metadata
-// #504 — deny_unknown_fields ensures a typo'd key (e.g. "max_deviaton_bps") is
-// rejected at parse time instead of being silently ignored and falling back to
-// the Default value, which would let the oracle run with wrong risk thresholds.
+/// server. Every field here is consumed somewhere: `symbol`,
+/// `stellar_address` and `sources` drive the oracle feed, the `*_bps` and
+/// `stale_after_seconds` fields are the risk/freshness thresholds, and
+/// `display_symbol` is surfaced by the API.
+///
+/// There are deliberately no static price-bound fields. An earlier revision
+/// carried `min`/`max` documented as "used by the API server for display", but
+/// nothing ever read them — the API serves the runtime percentile bounds from
+/// `CachedPrice`/`AggregatedPrice`, which are a different pair of values. They
+/// were removed rather than wired up (the same treatment the already-removed
+/// `sources_used` field got), so a config that still sets them now fails the
+/// `deny_unknown_fields` check below instead of being silently ignored.
+/// #504 — deny_unknown_fields ensures a typo'd key (e.g. "max_deviaton_bps") is
+/// rejected at parse time instead of being silently ignored and falling back to
+/// the Default value, which would let the oracle run with wrong risk thresholds.
 #[derive(Debug, Clone, Deserialize, PartialEq)]
 #[serde(default, deny_unknown_fields)]
 pub struct TokenConfig {
@@ -43,10 +52,6 @@ pub struct TokenConfig {
     pub submit_threshold_bps: u32,
     /// Maximum allowed Pyth confidence interval width in basis points.
     pub pyth_max_confidence_bps: u32,
-    /// Minimum price bound (used by the API server for display).
-    pub min: f64,
-    /// Maximum price bound (used by the API server for display).
-    pub max: f64,
 }
 
 impl Default for TokenConfig {
@@ -65,8 +70,6 @@ impl Default for TokenConfig {
             stale_after_seconds: 60,
             submit_threshold_bps: 10,
             pyth_max_confidence_bps: 50,
-            min: 0.0,
-            max: 0.0,
         }
     }
 }
@@ -95,7 +98,10 @@ impl TokenConfig {
 // ── Loading helpers ──────────────────────────────────────────────────────────
 
 /// Error type for configuration loading.
-#[derive(Debug, PartialEq)]
+///
+/// Derives `Clone`/`Eq` so it can be embedded in `oracle::config::EnvError`,
+/// which is itself `Clone + PartialEq + Eq`.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ConfigError {
     /// JSON parsing failed.
     MalformedJson(String),
@@ -138,6 +144,7 @@ pub fn parse_token_configs(raw: &str) -> Result<Vec<TokenConfig>, ConfigError> {
     }
 
     let mut symbols_seen = std::collections::HashSet::new();
+    let mut stellar_addresses_seen = std::collections::HashSet::new();
     let mut pyth_feed_ids_seen = std::collections::HashSet::new();
     let mut binance_symbols_seen = std::collections::HashSet::new();
     let mut coinbase_symbols_seen = std::collections::HashSet::new();
@@ -154,6 +161,16 @@ pub fn parse_token_configs(raw: &str) -> Result<Vec<TokenConfig>, ConfigError> {
                 symbol: token.symbol.clone(),
                 reason: "duplicate symbol (case-insensitive)".to_string(),
             });
+        }
+        // Validate stellar_address uniqueness (#872).
+        if !token.stellar_address.is_empty() {
+            let lower_address = token.stellar_address.to_lowercase();
+            if !stellar_addresses_seen.insert(lower_address) {
+                return Err(ConfigError::InvalidToken {
+                    symbol: token.symbol.clone(),
+                    reason: "duplicate stellar_address (case-insensitive)".to_string(),
+                });
+            }
         }
         // stellar_address and sources are optional for the API server path,
         // but required for the oracle path — the oracle validates separately.
@@ -290,8 +307,8 @@ mod tests {
     use super::*;
 
     const VALID_JSON: &str = r#"[
-        {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance","coinbase"],"min":44000.0,"max":46000.0},
-        {"symbol":"ETH","stellar_address":"CETHADDR","sources":["binance"],"min":2400.0,"max":2600.0}
+        {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance","coinbase"],"min_sources":1,"max_deviation_bps":100},
+        {"symbol":"ETH","stellar_address":"CETHADDR","sources":["binance"],"min_sources":1,"max_deviation_bps":100}
     ]"#;
 
     #[test]
@@ -300,7 +317,8 @@ mod tests {
         assert_eq!(tokens.len(), 2);
         assert_eq!(tokens[0].symbol, "BTC");
         assert_eq!(tokens[0].sources, vec!["binance", "coinbase"]);
-        assert_eq!(tokens[0].min, 44000.0);
+        assert_eq!(tokens[0].min_sources, 1);
+        assert_eq!(tokens[0].max_deviation_bps, 100);
     }
 
     #[test]
@@ -325,8 +343,8 @@ mod tests {
     #[test]
     fn reject_case_colliding_symbols() {
         let json = r#"[
-            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance"],"min":44000.0,"max":46000.0},
-            {"symbol":"btc","stellar_address":"CETHADDR","sources":["binance"],"min":2400.0,"max":2600.0}
+            {"symbol":"BTC","stellar_address":"CBTCADDR","sources":["binance"]},
+            {"symbol":"btc","stellar_address":"CETHADDR","sources":["binance"]}
         ]"#;
         let err = parse_token_configs(json).unwrap_err();
         match err {
@@ -382,6 +400,26 @@ mod tests {
         let json = r#"[{"symbol":"BTC","sources":["binance"],"max_deviation_bps":0}]"#;
         let err = parse_token_configs(json).unwrap_err();
         assert!(matches!(err, ConfigError::InvalidToken { .. }), "{err:?}");
+    }
+
+    /// The removed `min`/`max` price bounds must now be rejected rather than
+    /// silently ignored, so a config still carrying them fails loudly at parse
+    /// time instead of appearing to take effect.
+    #[test]
+    fn reject_removed_min_max_price_bounds() {
+        for field in ["min", "max"] {
+            let json = format!(r#"[{{"symbol":"BTC","sources":["binance"],"{field}":44000.0}}]"#);
+            let err = parse_token_configs(&json)
+                .expect_err(&format!("removed field '{field}' must be rejected"));
+            assert!(
+                matches!(err, ConfigError::MalformedJson(_)),
+                "expected MalformedJson for removed field '{field}', got: {err:?}"
+            );
+            assert!(
+                err.to_string().contains(field),
+                "error should name the offending field '{field}': {err}"
+            );
+        }
     }
 
     // #504 — range validation: max_deviation_bps above 10000 must fail.
@@ -476,4 +514,31 @@ mod tests {
         ]"#;
         assert!(parse_token_configs(json).is_ok());
     }
+}
+
+// #872 — duplicate stellar_address (case-insensitive) must be rejected.
+#[test]
+fn reject_duplicate_stellar_address() {
+    let json = r#"[
+            {"symbol":"TWBTC","stellar_address":"CBTCADDR","sources":["binance"]},
+            {"symbol":"TWETH","stellar_address":"cbtcaddr","sources":["coinbase"]}
+        ]"#;
+    let err = parse_token_configs(json).unwrap_err();
+    match err {
+        ConfigError::InvalidToken { symbol, reason } => {
+            assert_eq!(symbol, "TWETH");
+            assert_eq!(reason, "duplicate stellar_address (case-insensitive)");
+        }
+        _ => panic!("expected ConfigError::InvalidToken for duplicate stellar_address"),
+    }
+}
+
+// #872 — empty stellar_address values should not trigger duplicate check.
+#[test]
+fn allow_multiple_empty_stellar_addresses() {
+    let json = r#"[
+            {"symbol":"BTC","stellar_address":"","sources":["binance"]},
+            {"symbol":"ETH","stellar_address":"","sources":["coinbase"]}
+        ]"#;
+    assert!(parse_token_configs(json).is_ok());
 }
