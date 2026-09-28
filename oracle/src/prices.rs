@@ -81,16 +81,6 @@ pub fn aggregate_prices(
             .ok_or_else(|| "cannot compute confidence interval".to_string())?;
     let median = compute_median_allow_single(&cluster.filtered_prices).unwrap_or(props.min);
 
-    let rejected_sources = filter_result
-        .rejected
-        .into_iter()
-        .map(|(source, price, deviation)| RejectedSource {
-            source,
-            price,
-            deviation_bps: deviation,
-        })
-        .collect();
-
     Ok(AggregatedPrice {
         min: props.min,
         max: props.max,
@@ -662,19 +652,14 @@ mod tests {
     #[test]
     fn aggregate_prices_empty_input_with_zero_min_sources_returns_error() {
         // min_sources = 0 bypasses the earlier `prices.len() < min_sources`
-        // guard. #510 named the expected error as "cannot aggregate empty
-        // price list", but no such string exists anywhere in aggregate_prices
-        // or its helpers as currently implemented (confirmed via grep) — the
-        // empty case instead falls through filter_outliers (which returns an
-        // empty result for empty input, not an error) into
-        // compute_confidence_interval_with_spread, which is what actually
-        // rejects it. #510's premise was stale by the time this was worked;
-        // asserting the real error here rather than one that was never
-        // producible.
+        // guard, so the empty case reaches the cluster search. With no prices
+        // there is no cluster to find, so `find_largest_consistent_cluster`
+        // returns `None` and the cycle is rejected there — before any median,
+        // outlier filter, or confidence interval is computed.
         let prices: Vec<i128> = vec![];
         let sources: Vec<String> = vec![];
         let err = aggregate_prices(&prices, &sources, 0, 100).unwrap_err();
-        assert_eq!(err, "cannot compute confidence interval");
+        assert_eq!(err, "no consistent price cluster found");
     }
 
     // #510's third scenario ("construct two sources both outside

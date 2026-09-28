@@ -56,9 +56,7 @@ mod tests {
             max_deviation_bps: 100,
             stale_after_seconds: 60,
             submit_threshold_bps: 10,
-            min: 0.0,
-            max: 0.0,
-            pyth_max_confidence_bps: 50,
+            pyth_max_confidence_bps: 100,
         }
     }
 

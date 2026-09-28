@@ -50,29 +50,43 @@ fn submission_hash(nth: usize) -> String {
 }
 
 #[tokio::test]
-async fn empty_price_cache_returns_error_and_no_rpc_calls() {
+async fn empty_price_cache_skips_set_prices_but_still_succeeds() {
     let mock_server = MockServer::start().await;
     let rpc_url = mock_server.uri();
+
+    wiremock::Mock::given(wiremock::matchers::method("POST"))
+        .respond_with(ResponseTemplate::new(200).set_body_json(serde_json::json!({
+            "jsonrpc": "2.0", "id": 1, "result": 0
+        })))
+        .mount(&mock_server)
+        .await;
 
     let config = test_config_with_tokens(&rpc_url, "http://127.0.0.1:9", vec![test_token()]);
     let state = Arc::new(AppState::new(config));
 
     // Don't populate the price cache — leave it empty.
+    //
+    // #1145 changed this from a hard error to a degraded cycle: an empty
+    // price cache no longer aborts the run, because deposits and withdrawals
+    // do not depend on a fresh oracle price. The cycle reports
+    // `prices_stale` and skips `set_prices` plus order execution instead.
+    let result = oracle::keeper_loop::run_keeper_cycle(Arc::clone(&state)).await;
 
-    let result = oracle::keeper_loop::run_keeper_cycle(state).await;
+    let summary = result.expect("empty price cache must not fail the cycle");
+    assert!(summary.prices_stale, "cycle must report prices_stale");
+    assert_eq!(summary.orders_executed, 0);
+    assert_eq!(summary.errors, 0);
 
-    assert!(result.is_err(), "expected Err for empty price cache");
-    assert_eq!(
-        result.unwrap_err(),
-        "No fresh prices available in cache (cache size: 0, all stale)",
-        "error must match the exact string in execute_keeper_cycle"
-    );
-
-    // Verify no RPC calls were made — the function short-circuits before any network I/O.
-    let requests = mock_server.received_requests().await;
+    // No transaction was submitted: with no fresh price there is nothing to
+    // publish, and there is no pending work to execute.
+    let requests = mock_server.received_requests().await.unwrap_or_default();
+    let submitted = requests.iter().any(|req| {
+        let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
+        body["method"] == "sendTransaction"
+    });
     assert!(
-        requests.unwrap_or_default().is_empty(),
-        "no RPC calls should be made when cache is empty"
+        !submitted,
+        "no transaction should be submitted without prices"
     );
 }
 
@@ -169,9 +183,10 @@ async fn mock_rpc_full_keeper_cycle_with_pending_orders() {
 
             match method {
                 "simulateTransaction" => {
-                    let op = body["params"]["transaction"]["operations"][0].clone();
-                    let contract = op["contract_id"].as_str().unwrap_or("");
-                    let method_name = op["method"].as_str().unwrap_or("");
+                    let (contract, method_name) =
+                        common::simulated_invoke_target(&body).unwrap_or_default();
+                    let contract = contract.as_str();
+                    let method_name = method_name.as_str();
 
                     if contract == "CC6OZUHF3LVO6PNP3V2EB36ORB3YSVYSH3LWD3RFLO4NUO3BYCXSWSYC" {
                         if method_name == "get_order_count" {
@@ -274,9 +289,10 @@ async fn keeper_cycle_retries_transient_get_account_sequence_failure() {
 
             match method {
                 "simulateTransaction" => {
-                    let op = body["params"]["transaction"]["operations"][0].clone();
-                    let contract = op["contract_id"].as_str().unwrap_or("");
-                    let method_name = op["method"].as_str().unwrap_or("");
+                    let (contract, method_name) =
+                        common::simulated_invoke_target(&body).unwrap_or_default();
+                    let contract = contract.as_str();
+                    let method_name = method_name.as_str();
 
                     if contract == "CC6OZUHF3LVO6PNP3V2EB36ORB3YSVYSH3LWD3RFLO4NUO3BYCXSWSYC" {
                         if method_name == "get_order_count" {
@@ -440,9 +456,10 @@ async fn keeper_cycle_freezes_order_when_budget_exceeded_and_freeze_succeeds() {
 
             match method {
                 "simulateTransaction" => {
-                    let op = body["params"]["transaction"]["operations"][0].clone();
-                    let contract = op["contract_id"].as_str().unwrap_or("");
-                    let method_name = op["method"].as_str().unwrap_or("");
+                    let (contract, method_name) =
+                        common::simulated_invoke_target(&body).unwrap_or_default();
+                    let contract = contract.as_str();
+                    let method_name = method_name.as_str();
 
                     if contract == "CC6OZUHF3LVO6PNP3V2EB36ORB3YSVYSH3LWD3RFLO4NUO3BYCXSWSYC" {
                         if method_name == "get_order_count" {
@@ -562,9 +579,10 @@ async fn keeper_cycle_rejects_non_hex_order_key() {
 
             match method {
                 "simulateTransaction" => {
-                    let op = body["params"]["transaction"]["operations"][0].clone();
-                    let contract = op["contract_id"].as_str().unwrap_or("");
-                    let method_name = op["method"].as_str().unwrap_or("");
+                    let (contract, method_name) =
+                        common::simulated_invoke_target(&body).unwrap_or_default();
+                    let contract = contract.as_str();
+                    let method_name = method_name.as_str();
 
                     if contract == "CC6OZUHF3LVO6PNP3V2EB36ORB3YSVYSH3LWD3RFLO4NUO3BYCXSWSYC" {
                         if method_name == "get_order_count" {
@@ -683,8 +701,9 @@ macro_rules! mount_with_get_account {
                         // Return count=0 so we reach set_prices_on_chain → get_account_sequence.
                         // But we need pending work to reach get_account_sequence, so return 1
                         // for get_order_count and a valid key for get_order_keys.
-                        let op = body["params"]["transaction"]["operations"][0].clone();
-                        let method_name = op["method"].as_str().unwrap_or("");
+                        let (_, method_name) =
+                            common::simulated_invoke_target(&body).unwrap_or_default();
+                        let method_name = method_name.as_str();
                         if method_name == "get_order_count" {
                             ResponseTemplate::new(200).set_body_json(serde_json::json!({
                                 "jsonrpc": "2.0", "id": 1, "result": 1
@@ -851,9 +870,10 @@ fn mount_order_exec_always_fails(
         let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap();
         match body["method"].as_str().unwrap_or("") {
             "simulateTransaction" => {
-                let op = body["params"]["transaction"]["operations"][0].clone();
-                let contract = op["contract_id"].as_str().unwrap_or("");
-                let method_name = op["method"].as_str().unwrap_or("");
+                let (contract, method_name) =
+                    common::simulated_invoke_target(&body).unwrap_or_default();
+                let contract = contract.as_str();
+                let method_name = method_name.as_str();
                 if contract == "CC6OZUHF3LVO6PNP3V2EB36ORB3YSVYSH3LWD3RFLO4NUO3BYCXSWSYC" {
                     if method_name == "get_order_count" {
                         ResponseTemplate::new(200).set_body_json(serde_json::json!({

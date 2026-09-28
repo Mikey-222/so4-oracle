@@ -341,7 +341,7 @@ async fn get_ready_returns_503_when_keeper_loop_stale() {
         .await
         .unwrap();
     let json: serde_json::Value = serde_json::from_slice(&body).unwrap();
-    assert!(predicate::str::contains("stale").eval(json["error"].as_str().unwrap()));
+    assert!(predicates::str::contains("stale").eval(json["error"].as_str().unwrap()));
 }
 
 // #340 — readiness becomes healthy once the spawned price and keeper loops complete
@@ -375,9 +375,10 @@ async fn cold_start_reads_ready_after_price_and_keeper_loops() {
                     "result": {"id": "abc", "sequence": 12345, "protocolVersion": 22}
                 })),
                 "simulateTransaction" => {
-                    let op = body["params"]["transaction"]["operations"][0].clone();
-                    let contract = op["contract_id"].as_str().unwrap_or("");
-                    let method = op["method"].as_str().unwrap_or("");
+                    let (contract, method) = common::simulated_invoke_target(&body)
+                        .unwrap_or_else(|| (String::new(), String::new()));
+                    let contract = contract.as_str();
+                    let method = method.as_str();
 
                     if contract == "CC6OZUHF3LVO6PNP3V2EB36ORB3YSVYSH3LWD3RFLO4NUO3BYCXSWSYC" {
                         match method {
@@ -495,21 +496,42 @@ async fn cold_start_reads_ready_after_price_and_keeper_loops() {
     let price_handle = tokio::spawn(run_price_loop(Arc::clone(&state)));
     let keeper_handle = tokio::spawn(run_keeper_loop(Arc::clone(&state)));
 
-    let ready_ok = tokio::time::timeout(Duration::from_secs(20), async {
+    // Readiness and keeper submission are two independent milestones, and
+    // ordering between them is not guaranteed: a keeper cycle that starts
+    // before the price loop has published anything completes immediately with
+    // `prices_stale` (deposits/withdrawals still flow, #1145), which is enough
+    // for `last_keeper_cycle_at` to go fresh and flip /ready to 200. So wait
+    // for both, bounded by the same deadline, instead of checking the RPC log
+    // only at the instant /ready first turns green.
+    let observed = tokio::time::timeout(Duration::from_secs(20), async {
+        let mut ready = false;
+        let mut submitted = false;
         loop {
-            let response = app
-                .clone()
-                .oneshot(
-                    Request::builder()
-                        .uri("/ready")
-                        .body(Body::empty())
-                        .unwrap(),
-                )
-                .await
-                .unwrap();
+            if !ready {
+                let response = app
+                    .clone()
+                    .oneshot(
+                        Request::builder()
+                            .uri("/ready")
+                            .body(Body::empty())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap();
+                ready = response.status() == 200;
+            }
 
-            if response.status() == 200 {
-                break;
+            if !submitted {
+                let requests = rpc_mock.received_requests().await.unwrap_or_default();
+                submitted = requests.iter().any(|req| {
+                    let body: serde_json::Value =
+                        serde_json::from_slice(&req.body).unwrap_or_default();
+                    body["method"] == "sendTransaction"
+                });
+            }
+
+            if ready && submitted {
+                break (true, true);
             }
 
             tokio::time::sleep(Duration::from_millis(100)).await;
@@ -520,16 +542,9 @@ async fn cold_start_reads_ready_after_price_and_keeper_loops() {
     state.shutdown_token.cancel();
     let _ = tokio::join!(price_handle, keeper_handle);
 
-    assert!(ready_ok.is_ok(), "ready did not become healthy in time");
-
-    let requests = rpc_mock.received_requests().await.unwrap_or_default();
-    assert!(
-        requests.iter().any(|req| {
-            let body: serde_json::Value = serde_json::from_slice(&req.body).unwrap_or_default();
-            body["method"] == "sendTransaction"
-        }),
-        "keeper did not submit a transaction"
-    );
+    let (ready_ok, submitted) = observed.expect("readiness/submission did not settle in time");
+    assert!(ready_ok, "ready did not become healthy in time");
+    assert!(submitted, "keeper did not submit a transaction");
 }
 
 // #340 — GET /ready returns 503 when RPC is unreachable

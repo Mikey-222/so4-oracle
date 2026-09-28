@@ -284,7 +284,7 @@ mod tests {
     use crate::{AppState, Config};
     use axum::body::Body;
     use axum::http::header::CACHE_CONTROL;
-    use axum::http::Request;
+    use axum::http::{Request, StatusCode};
     use std::sync::Arc;
     use tower::ServiceExt;
 

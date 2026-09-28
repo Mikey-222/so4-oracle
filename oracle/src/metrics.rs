@@ -5,11 +5,30 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use serde::Serialize;
 
+/// Cumulative latency bucket upper bounds, in seconds, matching the `if`
+/// ladder in `record_http_request`. The trailing `+Inf` slot counts every
+/// request for the route, so its length is `Counters::http_request_duration_buckets`'s
+/// inner-array length.
+const HTTP_DURATION_BUCKETS: [&str; 7] = ["0.01", "0.05", "0.1", "0.25", "0.5", "1", "+Inf"];
+
 #[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
 pub struct HttpRouteLabels {
     pub route: String,
     pub method: String,
     pub status_class: String,
+}
+
+/// Label set for the per-source token counters.
+///
+/// Ordering is derived so this can key a `BTreeMap` without pulling in a
+/// hash-map hasher. The label set is bounded by
+/// (configured tokens × configured sources) — see
+/// `record_token_source_fetch_failure` for the cardinality argument.
+#[derive(Debug, Clone, Eq, PartialEq, Ord, PartialOrd)]
+pub struct TokenSourceLabels {
+    pub symbol: String,
+    pub token: String,
+    pub source: String,
 }
 
 /// All price-cycle and keeper-cycle counters, held behind a single mutex.
@@ -34,6 +53,8 @@ struct Counters {
     deposits_executed: u64,
     withdrawals_executed: u64,
     submit_failures: u64,
+    keeper_balance_low_count: u64,
+    prices_stale_count: u64,
     last_metrics_update: u64,
     http_requests_in_flight: u64,
     http_requests_total: BTreeMap<HttpRouteLabels, u64>,
@@ -44,17 +65,11 @@ struct Counters {
 
 #[derive(Debug, Default)]
 pub struct Metrics {
-    pub price_cycle_count: AtomicU64,
-    pub price_cycle_latency_ms: AtomicU64,
-    pub keeper_cycle_count: AtomicU64,
-    pub keeper_cycle_latency_ms: AtomicU64,
-    pub orders_executed: AtomicU64,
-    pub deposits_executed: AtomicU64,
-    pub withdrawals_executed: AtomicU64,
-    pub submit_failures: AtomicU64,
-    pub keeper_balance_low_count: AtomicU64,
-    pub prices_stale_count: AtomicU64,
-    pub last_metrics_update: AtomicU64,
+    /// Every cycle counter, behind one mutex so a single `record_*` call is
+    /// observed by readers as one consistent generation (#599).
+    counters: Mutex<Counters>,
+    token_source_fetch_failures: Mutex<BTreeMap<TokenSourceLabels, u64>>,
+    token_source_outlier_rejections: Mutex<BTreeMap<TokenSourceLabels, u64>>,
 }
 
 #[derive(Debug, Serialize)]
@@ -74,6 +89,21 @@ pub struct MetricsResponse {
     pub last_metrics_update: u64,
 }
 
+/// What a single keeper cycle did, as reported by the keeper loop.
+///
+/// Grouped into a struct rather than passed as seven positional arguments so
+/// the two `bool` flags cannot be transposed at a call site — a swapped pair
+/// would silently attribute a low-balance cycle as a stale-price one.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct KeeperCycleTally {
+    pub orders: usize,
+    pub deposits: usize,
+    pub withdrawals: usize,
+    pub errors: usize,
+    pub keeper_balance_low: bool,
+    pub prices_stale: bool,
+}
+
 impl Metrics {
     pub fn new() -> Arc<Self> {
         Arc::new(Self::default())
@@ -88,35 +118,21 @@ impl Metrics {
         Self::stamp(&mut c);
     }
 
-    pub fn record_keeper_cycle(
-        &self,
-        latency_ms: u64,
-        orders: usize,
-        deposits: usize,
-        withdrawals: usize,
-        errors: usize,
-        keeper_balance_low: bool,
-        prices_stale: bool,
-    ) {
-        self.keeper_cycle_count.fetch_add(1, Ordering::Relaxed);
-        self.keeper_cycle_latency_ms
-            .store(latency_ms, Ordering::Relaxed);
-        self.orders_executed
-            .fetch_add(orders as u64, Ordering::Relaxed);
-        self.deposits_executed
-            .fetch_add(deposits as u64, Ordering::Relaxed);
-        self.withdrawals_executed
-            .fetch_add(withdrawals as u64, Ordering::Relaxed);
-        self.submit_failures
-            .fetch_add(errors as u64, Ordering::Relaxed);
-        if keeper_balance_low {
-            self.keeper_balance_low_count
-                .fetch_add(1, Ordering::Relaxed);
+    pub fn record_keeper_cycle(&self, latency_ms: u64, tally: KeeperCycleTally) {
+        let mut c = self.counters.lock().unwrap_or_else(|p| p.into_inner());
+        c.keeper_cycle_count += 1;
+        c.keeper_cycle_latency_ms = latency_ms;
+        c.orders_executed += tally.orders as u64;
+        c.deposits_executed += tally.deposits as u64;
+        c.withdrawals_executed += tally.withdrawals as u64;
+        c.submit_failures += tally.errors as u64;
+        if tally.keeper_balance_low {
+            c.keeper_balance_low_count += 1;
         }
-        if prices_stale {
-            self.prices_stale_count.fetch_add(1, Ordering::Relaxed);
+        if tally.prices_stale {
+            c.prices_stale_count += 1;
         }
-        self.update_timestamp();
+        Self::stamp(&mut c);
     }
 
     pub fn record_submit_failure(&self) {
@@ -232,17 +248,19 @@ impl Metrics {
     pub fn to_response(&self) -> MetricsResponse {
         let c = self.counters.lock().unwrap_or_else(|p| p.into_inner());
         MetricsResponse {
-            price_cycle_count: self.price_cycle_count.load(Ordering::Relaxed),
-            price_cycle_latency_ms: self.price_cycle_latency_ms.load(Ordering::Relaxed),
-            keeper_cycle_count: self.keeper_cycle_count.load(Ordering::Relaxed),
-            keeper_cycle_latency_ms: self.keeper_cycle_latency_ms.load(Ordering::Relaxed),
-            orders_executed: self.orders_executed.load(Ordering::Relaxed),
-            deposits_executed: self.deposits_executed.load(Ordering::Relaxed),
-            withdrawals_executed: self.withdrawals_executed.load(Ordering::Relaxed),
-            submit_failures: self.submit_failures.load(Ordering::Relaxed),
-            keeper_balance_low_count: self.keeper_balance_low_count.load(Ordering::Relaxed),
-            prices_stale_count: self.prices_stale_count.load(Ordering::Relaxed),
-            last_metrics_update: self.last_metrics_update.load(Ordering::Relaxed),
+            price_cycle_count: c.price_cycle_count,
+            price_cycle_latency_ms: c.price_cycle_latency_ms,
+            token_fetch_ok: c.token_fetch_ok,
+            token_fetch_failures: c.token_fetch_failures,
+            keeper_cycle_count: c.keeper_cycle_count,
+            keeper_cycle_latency_ms: c.keeper_cycle_latency_ms,
+            orders_executed: c.orders_executed,
+            deposits_executed: c.deposits_executed,
+            withdrawals_executed: c.withdrawals_executed,
+            submit_failures: c.submit_failures,
+            keeper_balance_low_count: c.keeper_balance_low_count,
+            prices_stale_count: c.prices_stale_count,
+            last_metrics_update: c.last_metrics_update,
         }
     }
 
@@ -372,7 +390,7 @@ impl Metrics {
         output.push_str("# TYPE oracle_keeper_balance_low_count counter\n");
         output.push_str(&format!(
             "oracle_keeper_balance_low_count {}\n",
-            self.keeper_balance_low_count.load(Ordering::Relaxed)
+            c.keeper_balance_low_count
         ));
 
         output.push_str(
@@ -381,11 +399,55 @@ impl Metrics {
         output.push_str("# TYPE oracle_prices_stale_count counter\n");
         output.push_str(&format!(
             "oracle_prices_stale_count {}\n",
-            self.prices_stale_count.load(Ordering::Relaxed)
+            c.prices_stale_count
         ));
 
-        output.push_str("# HELP oracle_last_metrics_update Timestamp of last metrics update\n");
-        output.push_str("# TYPE oracle_last_metrics_update gauge\n");
+        output.push_str("# HELP oracle_http_requests_total Total HTTP requests by route, method and status class\n");
+        output.push_str("# TYPE oracle_http_requests_total counter\n");
+        for (labels, count) in &c.http_requests_total {
+            output.push_str(&format!(
+                "oracle_http_requests_total{{route=\"{}\",method=\"{}\",status_class=\"{}\"}} {}\n",
+                escape_label_value(&labels.route),
+                escape_label_value(&labels.method),
+                escape_label_value(&labels.status_class),
+                count
+            ));
+        }
+
+        // Cumulative histogram. The bucket bounds are the ones
+        // `record_http_request` writes into, in ascending order; the last slot
+        // is the +Inf catch-all and is always total request count for the
+        // route.
+        output.push_str(
+            "# HELP oracle_http_request_duration_seconds HTTP request duration by route\n",
+        );
+        output.push_str("# TYPE oracle_http_request_duration_seconds histogram\n");
+        for (route, buckets) in &c.http_request_duration_buckets {
+            let route_label = escape_label_value(route);
+            for (bound, count) in HTTP_DURATION_BUCKETS.iter().zip(buckets) {
+                output.push_str(&format!(
+                    "oracle_http_request_duration_seconds_bucket{{route=\"{route_label}\",le=\"{bound}\"}} {count}\n"
+                ));
+            }
+        }
+        for (route, sum) in &c.http_request_duration_sum {
+            output.push_str(&format!(
+                "oracle_http_request_duration_seconds_sum{{route=\"{}\"}} {}\n",
+                escape_label_value(route),
+                sum
+            ));
+        }
+        for (route, buckets) in &c.http_request_duration_buckets {
+            output.push_str(&format!(
+                "oracle_http_request_duration_seconds_count{{route=\"{}\"}} {}\n",
+                escape_label_value(route),
+                buckets[HTTP_DURATION_BUCKETS.len() - 1]
+            ));
+        }
+
+        output
+            .push_str("# HELP oracle_http_requests_in_flight HTTP requests currently in flight\n");
+        output.push_str("# TYPE oracle_http_requests_in_flight gauge\n");
         output.push_str(&format!(
             "oracle_http_requests_in_flight {}\n",
             c.http_requests_in_flight
@@ -419,8 +481,18 @@ mod tests {
     #[test]
     fn test_metrics_recording() {
         let metrics = Metrics::new();
-        metrics.record_price_cycle(100);
-        metrics.record_keeper_cycle(200, 5, 3, 2, 1, true, false);
+        metrics.record_price_cycle(100, 0, 0);
+        metrics.record_keeper_cycle(
+            200,
+            KeeperCycleTally {
+                orders: 5,
+                deposits: 3,
+                withdrawals: 2,
+                errors: 1,
+                keeper_balance_low: true,
+                prices_stale: false,
+            },
+        );
 
         let response = metrics.to_response();
         assert_eq!(response.price_cycle_count, 1);

@@ -61,7 +61,6 @@ pub fn build_price_message(
 /// - `min`: i128 Big-Endian
 /// - `max`: i128 Big-Endian
 /// - `timestamp`: u64 Big-Endian
-
 //Fix size implementation for i128 and u64 to ensure correct byte representation
 pub fn sign_price(
     private_key_hex: &str,

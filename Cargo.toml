@@ -31,9 +31,12 @@ mismatched_lifetime_syntaxes = "allow"
 overflow-checks = true
 panic = "abort"
 
-# NOTE: a version-only `[patch.crates-io]` entry for stellar-strkey used to live
-# here. Cargo rejects that form ("patches must point to different sources"),
-# which left the whole workspace unresolvable for every cargo command, so it was
-# removed. stellar-strkey 0.0.13/0.0.16/0.0.18 therefore coexist in Cargo.lock
-# until the transitive pins are bumped upstream.
-
+# NOTE: there is intentionally no [patch.crates-io] for stellar-strkey here.
+# A version-only patch (`stellar-strkey = { version = "0.0.18" }`, added for
+# #1007 to collapse the three copies stellar-xdr v27 pulls in) is rejected by
+# cargo >= 1.95 with "patch for `stellar-strkey` points to the same source,
+# but patches must point to different sources" — a manifest-level error that
+# made every cargo invocation in this workspace fail before compiling a single
+# line. The section was therefore inert, not load-bearing, and has been
+# removed. Collapsing the copies for real requires a patch entry with a real
+# `path` or `git` source, which is a separate change.

@@ -758,9 +758,7 @@ mod tests {
             max_deviation_bps: 100,
             stale_after_seconds: 60,
             submit_threshold_bps: 10,
-            min: 0.0,
-            max: 0.0,
-            sources_used: vec![],
+            pyth_max_confidence_bps: 100,
         };
 
         let state = test_state(token.clone());
@@ -789,9 +787,9 @@ mod tests {
         // spread = mid * 100 / 10_000 = 10_000_000_000_000_000_000_000_000_000
         // min = mid - spread = 990_000_000_000_000_000_000_000_000_000
         // max = mid + spread = 1_010_000_000_000_000_000_000_000_000_000
-        assert_eq!(cached.min, 990_000_000_000_000_000_000_000_000_000);
-        assert_eq!(cached.max, 1_010_000_000_000_000_000_000_000_000_000);
-        assert_eq!(cached.median, 1_000_000_000_000_000_000_000_000_000_000);
+        assert_eq!(cached.min, configured_price - spread);
+        assert_eq!(cached.max, configured_price + spread);
+        assert_eq!(cached.median, configured_price);
         assert_eq!(cached.ledger_seq, 123);
         assert_eq!(cached.sources_used, vec!["fixed"]);
         assert_eq!(cached.signature.len(), 128);
